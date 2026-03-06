@@ -1,0 +1,285 @@
+-- =========================
+-- 1. Konfiguracja
+-- =========================
+
+DECLARE v_end_month DATE;
+DECLARE v_months ARRAY<DATE>;
+
+DECLARE table_configs ARRAY<
+  STRUCT<
+    project_id STRING,
+    dataset_id STRING,
+    table_id STRING,
+    date_column STRING,
+    selected_columns ARRAY<STRING>
+  >
+>;
+
+-- poprzedni pełny miesiąc
+SET v_end_month = DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL 1 MONTH), MONTH);
+
+-- ostatnie 12 miesięcy jako początki miesięcy
+SET v_months = GENERATE_DATE_ARRAY(
+  DATE_SUB(v_end_month, INTERVAL 11 MONTH),
+  v_end_month,
+  INTERVAL 1 MONTH
+);
+
+-- lista tabel
+SET table_configs = [
+  ('my-project', 'sales_dq', 'orders_daily',  'data_date', []),
+  ('my-project', 'sales_dq', 'sales_monthly', 'data_date', ['amount', 'country', 'channel']),
+  ('my-project', 'sales_dq', 'customers',     'data_date', ['customer_id', 'status'])
+];
+
+-- =========================
+-- 2. Tabele tymczasowe
+-- =========================
+
+CREATE TEMP TABLE columns_to_profile (
+  project_id STRING,
+  dataset_id STRING,
+  table_id STRING,
+  date_column STRING,
+  column_name STRING,
+  data_type STRING
+);
+
+CREATE TEMP TABLE result_stats (
+  metric_group STRING,
+  profile_month DATE,
+  project_id STRING,
+  dataset_id STRING,
+  table_id STRING,
+  column_name STRING,
+  data_type STRING,
+  row_count INT64,
+  null_count INT64,
+  non_null_count INT64,
+  distinct_count INT64,
+  null_ratio FLOAT64,
+  distinct_ratio FLOAT64,
+  min_value FLOAT64,
+  max_value FLOAT64,
+  avg_value FLOAT64,
+  stddev_value FLOAT64,
+  zero_count INT64,
+  negative_count INT64,
+  empty_string_count INT64,
+  whitespace_only_count INT64,
+  min_length INT64,
+  max_length INT64,
+  avg_length FLOAT64
+);
+
+-- =========================
+-- 3. Zbieranie kolumn
+-- =========================
+
+FOR t IN (
+  SELECT * FROM UNNEST(table_configs)
+)
+DO
+
+  -- jeśli lista kolumn jest pusta -> bierz wszystkie wspierane
+  IF ARRAY_LENGTH(t.selected_columns) = 0 THEN
+
+    EXECUTE IMMEDIATE FORMAT("""
+      INSERT INTO columns_to_profile
+      SELECT
+        table_catalog,
+        table_schema,
+        table_name,
+        '%s' AS date_column,
+        column_name,
+        data_type
+      FROM `%s.%s.INFORMATION_SCHEMA.COLUMNS`
+      WHERE table_name = '%s'
+        AND column_name != '%s'
+        AND data_type IN ('INT64', 'NUMERIC', 'BIGNUMERIC', 'FLOAT64', 'STRING')
+    """,
+      t.date_column,
+      t.project_id,
+      t.dataset_id,
+      t.table_id,
+      t.date_column
+    );
+
+  ELSE
+
+    -- jeśli lista kolumn nie jest pusta -> bierz tylko wskazane
+    EXECUTE IMMEDIATE FORMAT("""
+      INSERT INTO columns_to_profile
+      SELECT
+        table_catalog,
+        table_schema,
+        table_name,
+        '%s' AS date_column,
+        column_name,
+        data_type
+      FROM `%s.%s.INFORMATION_SCHEMA.COLUMNS`
+      WHERE table_name = '%s'
+        AND column_name IN UNNEST(@selected_columns)
+        AND column_name != '%s'
+        AND data_type IN ('INT64', 'NUMERIC', 'BIGNUMERIC', 'FLOAT64', 'STRING')
+    """,
+      t.date_column,
+      t.project_id,
+      t.dataset_id,
+      t.table_id,
+      t.date_column
+    )
+    USING t.selected_columns AS selected_columns;
+
+  END IF;
+
+END FOR;
+
+-- =========================
+-- 4. Liczenie statystyk
+-- =========================
+
+FOR m IN (
+  SELECT month_start
+  FROM UNNEST(v_months) AS month_start
+  ORDER BY month_start
+)
+DO
+
+  FOR c IN (
+    SELECT * FROM columns_to_profile
+  )
+  DO
+
+    -- -------------------------
+    -- kolumny numeryczne
+    -- -------------------------
+    IF c.data_type IN ('INT64', 'NUMERIC', 'BIGNUMERIC', 'FLOAT64') THEN
+
+      EXECUTE IMMEDIATE FORMAT("""
+        INSERT INTO result_stats
+        SELECT
+          'NUMERIC' AS metric_group,
+          @profile_month AS profile_month,
+          '%s' AS project_id,
+          '%s' AS dataset_id,
+          '%s' AS table_id,
+          '%s' AS column_name,
+          '%s' AS data_type,
+          COUNT(*) AS row_count,
+          COUNTIF(`%s` IS NULL) AS null_count,
+          COUNTIF(`%s` IS NOT NULL) AS non_null_count,
+          COUNT(DISTINCT `%s`) AS distinct_count,
+          SAFE_DIVIDE(COUNTIF(`%s` IS NULL), COUNT(*)) AS null_ratio,
+          SAFE_DIVIDE(COUNT(DISTINCT `%s`), COUNTIF(`%s` IS NOT NULL)) AS distinct_ratio,
+          MIN(CAST(`%s` AS FLOAT64)) AS min_value,
+          MAX(CAST(`%s` AS FLOAT64)) AS max_value,
+          AVG(CAST(`%s` AS FLOAT64)) AS avg_value,
+          STDDEV(CAST(`%s` AS FLOAT64)) AS stddev_value,
+          COUNTIF(`%s` = 0) AS zero_count,
+          COUNTIF(`%s` < 0) AS negative_count,
+          NULL AS empty_string_count,
+          NULL AS whitespace_only_count,
+          NULL AS min_length,
+          NULL AS max_length,
+          NULL AS avg_length
+        FROM `%s.%s.%s`
+        WHERE `%s` >= @profile_month
+          AND `%s` < DATE_ADD(@profile_month, INTERVAL 1 MONTH)
+      """,
+        c.project_id,
+        c.dataset_id,
+        c.table_id,
+        c.column_name,
+        c.data_type,
+        c.column_name,
+        c.column_name,
+        c.column_name,
+        c.column_name,
+        c.column_name,
+        c.column_name,
+        c.column_name,
+        c.column_name,
+        c.column_name,
+        c.column_name,
+        c.project_id,
+        c.dataset_id,
+        c.table_id,
+        c.date_column,
+        c.date_column
+      )
+      USING m.month_start AS profile_month;
+
+    END IF;
+
+    -- -------------------------
+    -- kolumny tekstowe
+    -- -------------------------
+    IF c.data_type = 'STRING' THEN
+
+      EXECUTE IMMEDIATE FORMAT("""
+        INSERT INTO result_stats
+        SELECT
+          'TEXT' AS metric_group,
+          @profile_month AS profile_month,
+          '%s' AS project_id,
+          '%s' AS dataset_id,
+          '%s' AS table_id,
+          '%s' AS column_name,
+          '%s' AS data_type,
+          COUNT(*) AS row_count,
+          COUNTIF(`%s` IS NULL) AS null_count,
+          COUNTIF(`%s` IS NOT NULL) AS non_null_count,
+          COUNT(DISTINCT `%s`) AS distinct_count,
+          SAFE_DIVIDE(COUNTIF(`%s` IS NULL), COUNT(*)) AS null_ratio,
+          SAFE_DIVIDE(COUNT(DISTINCT `%s`), COUNTIF(`%s` IS NOT NULL)) AS distinct_ratio,
+          NULL AS min_value,
+          NULL AS max_value,
+          NULL AS avg_value,
+          NULL AS stddev_value,
+          NULL AS zero_count,
+          NULL AS negative_count,
+          COUNTIF(`%s` = '') AS empty_string_count,
+          COUNTIF(`%s` IS NOT NULL AND `%s` != '' AND TRIM(`%s`) = '') AS whitespace_only_count,
+          MIN(LENGTH(`%s`)) AS min_length,
+          MAX(LENGTH(`%s`)) AS max_length,
+          AVG(LENGTH(`%s`)) AS avg_length
+        FROM `%s.%s.%s`
+        WHERE `%s` >= @profile_month
+          AND `%s` < DATE_ADD(@profile_month, INTERVAL 1 MONTH)
+      """,
+        c.project_id,
+        c.dataset_id,
+        c.table_id,
+        c.column_name,
+        c.data_type,
+        c.column_name,
+        c.column_name,
+        c.column_name,
+        c.column_name,
+        c.column_name,
+        c.column_name,
+        c.column_name,
+        c.column_name,
+        c.column_name,
+        c.project_id,
+        c.dataset_id,
+        c.table_id,
+        c.date_column,
+        c.date_column
+      )
+      USING m.month_start AS profile_month;
+
+    END IF;
+
+  END FOR;
+
+END FOR;
+
+-- =========================
+-- 5. Wynik
+-- =========================
+
+SELECT *
+FROM result_stats
+ORDER BY profile_month, project_id, dataset_id, table_id, column_name;
